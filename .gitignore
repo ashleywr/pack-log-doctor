@@ -6,3 +6,10 @@ out/
 *.iml
 logs/
 crash-reports/
+
+# Eclipse / Buildship
+.classpath
+.project
+.settings/
+.eclipse/
+bin/
