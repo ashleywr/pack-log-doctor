@@ -7,6 +7,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ReportConfigTest {
@@ -28,5 +29,14 @@ class ReportConfigTest {
         assertEquals(ReportConfig.defaults().maxGroupedIssues(), config.maxGroupedIssues());
         assertEquals(ReportConfig.defaults().maxExamplesPerIssue(), config.maxExamplesPerIssue());
         assertEquals(ReportConfig.defaults().maxLoudestMods(), config.maxLoudestMods());
+    }
+
+    @Test
+    void neverPrintsReportSummariesToMinecraftLog() {
+        assertFalse(ReportConfig.defaults().printSummaryToLog());
+
+        ReportConfig legacyConfig = new ReportConfig(50, 3, 20, true, true, true, true, true, "", "");
+
+        assertFalse(legacyConfig.sanitized().printSummaryToLog());
     }
 }

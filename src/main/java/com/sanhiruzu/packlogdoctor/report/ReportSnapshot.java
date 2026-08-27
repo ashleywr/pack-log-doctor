@@ -13,6 +13,8 @@ public record ReportSnapshot(
         ReportEnvironment environment,
         Set<String> loadedModIds,
         Map<String, Integer> loudestMods,
+        StartupTimingReport startupTimings,
+        List<UncaughtExceptionSnapshot> uncaughtExceptions,
         List<IssueSnapshot> issues
 ) {
     public ReportSnapshot(
@@ -22,6 +24,27 @@ public record ReportSnapshot(
             Map<String, Integer> loudestMods,
             List<IssueSnapshot> issues
     ) {
-        this(generatedAt, trigger, ReportEnvironment.unknown(), loadedModIds, loudestMods, issues);
+        this(generatedAt, trigger, ReportEnvironment.unknown(), loadedModIds, loudestMods, StartupTimingReport.empty(), List.of(), issues);
+    }
+
+    public ReportSnapshot(
+            Instant generatedAt,
+            String trigger,
+            ReportEnvironment environment,
+            Set<String> loadedModIds,
+            Map<String, Integer> loudestMods,
+            StartupTimingReport startupTimings,
+            List<IssueSnapshot> issues
+    ) {
+        this(generatedAt, trigger, environment, loadedModIds, loudestMods, startupTimings, List.of(), issues);
+    }
+
+    public ReportSnapshot {
+        if (startupTimings == null) {
+            startupTimings = StartupTimingReport.empty();
+        }
+        if (uncaughtExceptions == null) {
+            uncaughtExceptions = List.of();
+        }
     }
 }

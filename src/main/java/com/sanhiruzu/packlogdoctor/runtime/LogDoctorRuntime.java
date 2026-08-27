@@ -1,8 +1,10 @@
 package com.sanhiruzu.packlogdoctor.runtime;
 
 import com.sanhiruzu.packlogdoctor.analysis.LogIssueAnalyzer;
+import com.sanhiruzu.packlogdoctor.analysis.LogFileIssueAnalyzer;
 import com.sanhiruzu.packlogdoctor.analysis.LogObservation;
 import com.sanhiruzu.packlogdoctor.PackLogDoctor;
+import com.sanhiruzu.packlogdoctor.analysis.StartupTimingAnalyzer;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
@@ -17,6 +19,7 @@ import com.sanhiruzu.packlogdoctor.report.ModDependencySnapshot;
 import com.sanhiruzu.packlogdoctor.report.ReportEnvironment;
 import com.sanhiruzu.packlogdoctor.report.ReportSnapshot;
 import com.sanhiruzu.packlogdoctor.report.ReportWriter;
+import com.sanhiruzu.packlogdoctor.report.UncaughtExceptionSnapshot;
 import net.minecraft.SharedConstants;
 import net.neoforged.fml.ModList;
 import net.neoforged.fml.loading.FMLPaths;
@@ -24,7 +27,6 @@ import net.neoforged.neoforgespi.language.IModFileInfo;
 import net.neoforged.neoforgespi.language.IModInfo;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.core.LoggerContext;
 import org.apache.logging.log4j.core.config.Configuration;
 import org.apache.logging.log4j.core.config.LoggerConfig;
@@ -32,8 +34,12 @@ import org.apache.logging.log4j.core.config.LoggerConfig;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -44,7 +50,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class LogDoctorRuntime {
-    private static final Logger LOGGER = LogManager.getLogger("PackLogDoctor");
     private static final AtomicReference<LogDoctorRuntime> INSTALLED = new AtomicReference<>();
     private static final Gson GSON = new GsonBuilder()
             .registerTypeAdapter(Instant.class, (com.google.gson.JsonSerializer<Instant>)
@@ -55,11 +60,14 @@ public final class LogDoctorRuntime {
             .create();
 
     private final LogIssueAnalyzer analyzer;
+    private final StartupTimingAnalyzer startupTimingAnalyzer;
     private final ReportWriter reportWriter;
     private final ReportConfig config;
     private final Path gameDir;
     private final Set<String> loadedModIds;
     private final ReportEnvironment environment;
+    private final SuppressionConfig suppressionConfig;
+    private final List<UncaughtExceptionSnapshot> uncaughtExceptions = Collections.synchronizedList(new ArrayList<>());
     private final AtomicBoolean writingReport = new AtomicBoolean();
     private final AtomicBoolean terminalReportWritten = new AtomicBoolean();
     private final AtomicBoolean startupReportWritten = new AtomicBoolean();
@@ -69,8 +77,10 @@ public final class LogDoctorRuntime {
         this.config = config;
         this.loadedModIds = Set.copyOf(loadedModIds);
         this.analyzer = new LogIssueAnalyzer(loadedModIds);
+        this.startupTimingAnalyzer = new StartupTimingAnalyzer();
         this.reportWriter = new ReportWriter(gameDir, config);
         this.environment = environmentSnapshot(gameDir, config);
+        this.suppressionConfig = SuppressionConfig.load(gameDir.resolve("pack-log-doctor").resolve("suppression-config.json"));
     }
 
     public static LogDoctorRuntime install() {
@@ -102,6 +112,16 @@ public final class LogDoctorRuntime {
         }
     }
 
+    void observeLogEvent(Instant timestamp, com.sanhiruzu.packlogdoctor.analysis.Severity severity, String level, String loggerName, String threadName, String message, String throwableSummary) {
+        if (writingReport.get()) {
+            return;
+        }
+        startupTimingAnalyzer.observe(timestamp, level, loggerName, threadName, message);
+        if (severity != null) {
+            observe(new LogObservation(timestamp, severity, loggerName, threadName, message, throwableSummary));
+        }
+    }
+
     public void writeReport(String trigger) {
         if ("shutdown".equals(trigger) && terminalReportWritten.get()) {
             return;
@@ -110,18 +130,8 @@ public final class LogDoctorRuntime {
             return;
         }
         try {
-            ReportSnapshot snapshot = new ReportSnapshot(
-                    Instant.now(),
-                    trigger,
-                    environment,
-                    loadedModIds,
-                    analyzer.loudestMods(),
-                    analyzer.snapshots()
-            );
+            ReportSnapshot snapshot = snapshot(trigger);
             reportWriter.write(snapshot);
-            if (config.printSummaryToLog()) {
-                printSummary(snapshot);
-            }
             if ("shutdown".equals(trigger) && startupReportWritten.get() && !hasFatalIssue(snapshot)) {
                 writeSuccessfulLaunchBaseline(environment.modFiles());
             }
@@ -129,9 +139,44 @@ public final class LogDoctorRuntime {
                 terminalReportWritten.set(true);
             }
         } catch (Throwable throwable) {
-            System.err.println("Pack Log Doctor failed to write report: " + throwable);
         } finally {
             writingReport.set(false);
+        }
+    }
+
+    private ReportSnapshot snapshot(String trigger) {
+        Path latestLog = gameDir.resolve("logs").resolve("latest.log");
+        if (Files.isRegularFile(latestLog)) {
+            try {
+                LogFileIssueAnalyzer.Result result = new LogFileIssueAnalyzer(loadedModIds).analyze(latestLog);
+                return new ReportSnapshot(
+                        Instant.now(),
+                        trigger + "+latest-log",
+                        environment,
+                        loadedModIds,
+                        result.loudestMods(),
+                        startupTimingAnalyzer.snapshot(),
+                        uncaughtExceptionSnapshots(),
+                        result.issues()
+                );
+            } catch (Throwable throwable) {
+            }
+        }
+        return new ReportSnapshot(
+                Instant.now(),
+                trigger,
+                environment,
+                loadedModIds,
+                analyzer.loudestMods(),
+                startupTimingAnalyzer.snapshot(),
+                uncaughtExceptionSnapshots(),
+                analyzer.snapshots()
+        );
+    }
+
+    private List<UncaughtExceptionSnapshot> uncaughtExceptionSnapshots() {
+        synchronized (uncaughtExceptions) {
+            return List.copyOf(uncaughtExceptions);
         }
     }
 
@@ -151,12 +196,12 @@ public final class LogDoctorRuntime {
     private void installAppender() {
         LoggerContext context = (LoggerContext) LogManager.getContext(false);
         Configuration configuration = context.getConfiguration();
-        LogDoctorAppender appender = new LogDoctorAppender(this);
+        LogDoctorAppender appender = new LogDoctorAppender(this, suppressionConfig);
         appender.start();
         configuration.addAppender(appender);
-        configuration.getRootLogger().addAppender(appender, Level.WARN, null);
+        configuration.getRootLogger().addAppender(appender, Level.INFO, null);
         for (LoggerConfig loggerConfig : configuration.getLoggers().values()) {
-            loggerConfig.addAppender(appender, Level.WARN, null);
+            loggerConfig.addAppender(appender, Level.INFO, null);
         }
         context.updateLoggers();
     }
@@ -178,17 +223,24 @@ public final class LogDoctorRuntime {
         Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
         Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
             try {
+                Instant timestamp = Instant.now();
+                String stackTrace = stackTrace(throwable);
+                uncaughtExceptions.add(new UncaughtExceptionSnapshot(
+                        timestamp,
+                        thread.getName(),
+                        throwable.toString(),
+                        stackTrace
+                ));
                 observe(new LogObservation(
-                        Instant.now(),
+                        timestamp,
                         com.sanhiruzu.packlogdoctor.analysis.Severity.FATAL,
                         "uncaught-exception",
                         thread.getName(),
                         throwable.toString(),
-                        stackTrace(throwable)
+                        stackTrace
                 ));
                 writeReport("uncaught-exception");
             } catch (Throwable reportFailure) {
-                System.err.println("Pack Log Doctor failed during uncaught exception handling: " + reportFailure);
             }
 
             if (previous != null) {
@@ -197,47 +249,11 @@ public final class LogDoctorRuntime {
         });
     }
 
-    private void printSummary(ReportSnapshot snapshot) {
-        StringBuilder builder = new StringBuilder();
-        builder.append("Pack Log Doctor summary [").append(snapshot.trigger()).append("]: ")
-                .append(snapshot.issues().size()).append(" grouped issue(s), ")
-                .append(snapshot.loadedModIds().size()).append(" loaded mod(s).");
-        if (!snapshot.loudestMods().isEmpty()) {
-            builder.append(" Loudest likely mods: ");
-            snapshot.loudestMods().entrySet().stream()
-                    .limit(5)
-                    .forEach(entry -> builder.append(entry.getKey()).append('=').append(entry.getValue()).append(' '));
-        }
-        snapshot.issues().stream()
-                .limit(3)
-                .forEach(issue -> builder.append(System.lineSeparator())
-                        .append("- ").append(issue.severity()).append(" x").append(issue.count())
-                        .append(" ").append(issue.category())
-                        .append(" likely=").append(issue.likelyModCounts().keySet()));
-        builder.append(System.lineSeparator())
-                .append("Full report: pack-log-doctor/report.html, report.md, report.json, plus archived copies under pack-log-doctor/reports");
-
-        String summary = builder.toString();
-        try {
-            LOGGER.warn(summary);
-        } catch (Throwable ignored) {
-            // Log4j can already be shutting down when the JVM shutdown hook runs.
-        }
-        System.err.println(summary);
-    }
-
     private static String stackTrace(Throwable throwable) {
-        StringBuilder builder = new StringBuilder();
-        for (StackTraceElement element : throwable.getStackTrace()) {
-            builder.append(element).append('\n');
-        }
-        if (throwable.getCause() != null) {
-            builder.append("Caused by: ").append(throwable.getCause()).append('\n');
-            for (StackTraceElement element : throwable.getCause().getStackTrace()) {
-                builder.append(element).append('\n');
-            }
-        }
-        return builder.toString();
+        StringWriter writer = new StringWriter();
+        throwable.printStackTrace(new PrintWriter(writer));
+        String text = writer.toString();
+        return text.length() > 24_000 ? text.substring(0, 24_000) : text;
     }
 
     private static Set<String> loadedModIds() {
@@ -416,7 +432,6 @@ public final class LogDoctorRuntime {
             Files.createDirectories(path.getParent());
             Files.writeString(path, GSON.toJson(modFiles));
         } catch (Throwable throwable) {
-            System.err.println("Pack Log Doctor failed to write successful launch baseline: " + throwable);
         }
     }
 

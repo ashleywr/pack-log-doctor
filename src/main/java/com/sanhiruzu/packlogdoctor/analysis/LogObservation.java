@@ -17,7 +17,7 @@ public record LogObservation(
         loggerName = sanitize(loggerName);
         threadName = sanitize(threadName);
         message = sanitize(message);
-        throwableSummary = sanitize(throwableSummary);
+        throwableSummary = throwableSummary == null ? "" : throwableSummary.stripTrailing();
     }
 
     private static String sanitize(String value) {

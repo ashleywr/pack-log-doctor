@@ -14,26 +14,33 @@ import java.time.Instant;
 
 final class LogDoctorAppender extends AbstractAppender {
     private final LogDoctorRuntime runtime;
+    private final SuppressionConfig suppressionConfig;
 
-    LogDoctorAppender(LogDoctorRuntime runtime) {
+    LogDoctorAppender(LogDoctorRuntime runtime, SuppressionConfig suppressionConfig) {
         super("PackLogDoctorAppender", null, PatternLayout.createDefaultLayout(), true, Property.EMPTY_ARRAY);
         this.runtime = runtime;
+        this.suppressionConfig = suppressionConfig;
     }
 
     @Override
     public void append(LogEvent event) {
-        Severity severity = severityOf(event.getLevel());
-        if (severity == null) {
+        String loggerName = event.getLoggerName();
+        String message = event.getMessage() == null ? "" : event.getMessage().getFormattedMessage();
+
+        if (suppressionConfig.isSuppressed(loggerName, message)) {
             return;
         }
-        runtime.observe(new LogObservation(
+
+        Severity severity = severityOf(event.getLevel());
+        runtime.observeLogEvent(
                 Instant.ofEpochMilli(event.getTimeMillis()),
                 severity,
-                event.getLoggerName(),
+                event.getLevel() == null ? "" : event.getLevel().name(),
+                loggerName,
                 event.getThreadName(),
-                event.getMessage() == null ? "" : event.getMessage().getFormattedMessage(),
+                message,
                 throwableSummary(event.getThrown())
-        ));
+        );
     }
 
     private Severity severityOf(Level level) {

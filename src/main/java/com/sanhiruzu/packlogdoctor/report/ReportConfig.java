@@ -36,7 +36,7 @@ public record ReportConfig(
                 true,
                 true,
                 true,
-                true,
+                false,
                 true,
                 "",
                 ""
@@ -44,7 +44,7 @@ public record ReportConfig(
     }
 
     public ReportConfig(int maxGroupedIssues, int maxExamplesPerIssue, int maxLoudestMods, boolean writeMarkdown, boolean writeJson) {
-        this(maxGroupedIssues, maxExamplesPerIssue, maxLoudestMods, writeMarkdown, writeJson, true, true, true, "", "");
+        this(maxGroupedIssues, maxExamplesPerIssue, maxLoudestMods, writeMarkdown, writeJson, true, false, true, "", "");
     }
 
     public static ReportConfig loadOrCreate(Path gameDir) {
@@ -60,7 +60,6 @@ public record ReportConfig(
             ReportConfig loaded = GSON.fromJson(json, ReportConfig.class);
             return loaded == null ? defaults : loaded.sanitized();
         } catch (Exception exception) {
-            System.err.println("Pack Log Doctor failed to read config, using defaults: " + exception.getMessage());
             return defaults;
         }
     }
@@ -70,7 +69,6 @@ public record ReportConfig(
             Files.createDirectories(path.getParent());
             Files.writeString(path, GSON.toJson(defaults), StandardCharsets.UTF_8);
         } catch (IOException exception) {
-            System.err.println("Pack Log Doctor failed to write default config: " + exception.getMessage());
         }
     }
 
@@ -82,7 +80,7 @@ public record ReportConfig(
                 writeMarkdown,
                 writeJson,
                 writeHtml == null ? true : writeHtml,
-                printSummaryToLog,
+                false,
                 writeStartupReport == null ? true : writeStartupReport,
                 clean(modpackName),
                 clean(modpackVersion)

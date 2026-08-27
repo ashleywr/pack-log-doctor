@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonPrimitive;
 import com.sanhiruzu.packlogdoctor.analysis.IssueSnapshot;
+import com.sanhiruzu.packlogdoctor.analysis.Severity;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -26,10 +27,12 @@ public final class ReportWriter {
                     (value, type, context) -> new JsonPrimitive(DateTimeFormatter.ISO_INSTANT.format(value)))
             .setPrettyPrinting()
             .create();
+    private final Path gameDir;
     private final Path outputDir;
     private final ReportConfig config;
 
     public ReportWriter(Path gameDir, ReportConfig config) {
+        this.gameDir = gameDir;
         this.outputDir = gameDir.resolve("pack-log-doctor");
         this.config = config.sanitized();
     }
@@ -54,6 +57,11 @@ public final class ReportWriter {
             String html = html(limited);
             writeLatestAndArchive(outputDir.resolve("report.html"), archiveDir.resolve(archiveBaseName + ".html"), html);
         }
+        writeUnexpectedReports(limited, archiveDir, archiveBaseName);
+        String agentJson = agentActionPlan(limited);
+        writeLatestAndArchive(outputDir.resolve("agent-action-plan.json"), archiveDir.resolve(archiveBaseName + "-agent.json"), agentJson);
+        writeSuggestedSuppressions(limited);
+        writeLog4j2Config();
     }
 
     public Path htmlPath() {
@@ -71,6 +79,107 @@ public final class ReportWriter {
     private void writeLatestAndArchive(Path latestPath, Path archivePath, String content) throws IOException {
         Files.writeString(latestPath, content, StandardCharsets.UTF_8);
         Files.writeString(archivePath, content, StandardCharsets.UTF_8);
+    }
+
+    private void writeUnexpectedReports(ReportSnapshot snapshot, Path archiveDir, String archiveBaseName) throws IOException {
+        IssueBaselineConfig baseline = loadIssueBaseline();
+        UnexpectedReport unexpected = unexpectedReport(snapshot, baseline);
+        String json = gson.toJson(unexpected.asJson());
+        writeLatestAndArchive(
+                outputDir.resolve("unexpected-report.json"),
+                archiveDir.resolve(archiveBaseName + "-unexpected.json"),
+                json
+        );
+        String markdown = unexpectedMarkdown(snapshot, unexpected);
+        writeLatestAndArchive(
+                outputDir.resolve("unexpected-report.md"),
+                archiveDir.resolve(archiveBaseName + "-unexpected.md"),
+                markdown
+        );
+    }
+
+    private IssueBaselineConfig loadIssueBaseline() {
+        Path local = outputDir.resolve("issue-baseline.json");
+        if (Files.isRegularFile(local)) {
+            return IssueBaselineConfig.load(local);
+        }
+        return IssueBaselineConfig.load(gameDir.resolve("config").resolve("packlogdoctor-issue-baseline.json"));
+    }
+
+    private UnexpectedReport unexpectedReport(ReportSnapshot snapshot, IssueBaselineConfig baseline) {
+        List<IssueSnapshot> unexpectedIssues = new java.util.ArrayList<>();
+        Map<String, Integer> knownIssueCounts = new LinkedHashMap<>();
+        Map<String, Integer> knownEventCounts = new LinkedHashMap<>();
+        Map<String, String> knownNotes = new LinkedHashMap<>();
+
+        for (IssueSnapshot issue : snapshot.issues()) {
+            IssueDisposition disposition = baseline.dispositionFor(issue);
+            if (disposition.isUnexpected()) {
+                unexpectedIssues.add(issue);
+                continue;
+            }
+            if (shouldAlwaysSurface(issue)) {
+                unexpectedIssues.add(issue);
+            }
+            knownIssueCounts.merge(disposition.status(), 1, Integer::sum);
+            knownEventCounts.merge(disposition.status(), issue.count(), Integer::sum);
+            if (!disposition.note().isBlank()) {
+                knownNotes.putIfAbsent(disposition.status(), disposition.note());
+            }
+        }
+        return new UnexpectedReport(unexpectedIssues, knownIssueCounts, knownEventCounts, knownNotes);
+    }
+
+    private boolean shouldAlwaysSurface(IssueSnapshot issue) {
+        return issue.severity().isAtLeast(Severity.ERROR);
+    }
+
+    private String unexpectedMarkdown(ReportSnapshot snapshot, UnexpectedReport report) {
+        StringBuilder builder = new StringBuilder();
+        builder.append("# Pack Log Doctor Unexpected Report\n\n");
+        builder.append("- Generated: ").append(DateTimeFormatter.ISO_INSTANT.format(snapshot.generatedAt())).append('\n');
+        builder.append("- Trigger: ").append(snapshot.trigger()).append('\n');
+        builder.append("- Baseline: `pack-log-doctor/issue-baseline.json` or `config/packlogdoctor-issue-baseline.json`\n\n");
+
+        builder.append("## Unexpected warnings and errors\n\n");
+        if (report.issues().isEmpty()) {
+            builder.append("No unexpected warnings or errors remain after applying the issue baseline.\n\n");
+        } else {
+            int index = 1;
+            for (IssueSnapshot issue : report.issues()) {
+                builder.append("### ").append(index++).append(". ")
+                        .append(issue.severity()).append(" x").append(issue.count())
+                        .append(" - ").append(issue.category()).append("\n\n");
+                builder.append("- Signature: `").append(issue.signature()).append("`\n");
+                builder.append("- Likely mods: ").append(formatCounts(issue.likelyModCounts())).append('\n');
+                builder.append("- Loggers: ").append(formatCounts(issue.loggerCounts())).append("\n\n");
+                if (!issue.examples().isEmpty()) {
+                    builder.append("Examples:\n\n");
+                    for (String example : issue.examples()) {
+                        builder.append("```text\n").append(example).append("\n```\n\n");
+                    }
+                }
+            }
+        }
+
+        builder.append("## Known reviewed issues summarized\n\n");
+        if (report.knownIssueCounts().isEmpty()) {
+            builder.append("No reviewed baseline rules matched this report.\n");
+        } else {
+            for (Map.Entry<String, Integer> entry : report.knownIssueCounts().entrySet()) {
+                String status = entry.getKey();
+                int events = report.knownEventCounts().getOrDefault(status, 0);
+                builder.append("- ").append(status).append(": ")
+                        .append(entry.getValue()).append(" issue group(s), ")
+                        .append(events).append(" event(s)");
+                String note = report.knownNotes().getOrDefault(status, "");
+                if (!note.isBlank()) {
+                    builder.append(" - ").append(note);
+                }
+                builder.append('\n');
+            }
+        }
+        return builder.toString();
     }
 
     private void writeDraftFiles(ReportSnapshot snapshot) throws IOException {
@@ -157,6 +266,10 @@ public final class ReportWriter {
                 snapshot.environment(),
                 snapshot.loadedModIds(),
                 limitCounts(snapshot.loudestMods(), config.maxLoudestMods()),
+                snapshot.startupTimings(),
+                snapshot.uncaughtExceptions().stream()
+                        .limit(config.maxExamplesPerIssue())
+                        .toList(),
                 issues
         );
     }
@@ -184,6 +297,153 @@ public final class ReportWriter {
         return counts.entrySet().stream()
                 .limit(limit)
                 .collect(LinkedHashMap::new, (map, entry) -> map.put(entry.getKey(), entry.getValue()), LinkedHashMap::putAll);
+    }
+
+    private String agentActionPlan(ReportSnapshot snapshot) {
+        Map<String, Object> plan = new LinkedHashMap<>();
+        plan.put("metadata", Map.of(
+                "generatedAt", DateTimeFormatter.ISO_INSTANT.format(snapshot.generatedAt()),
+                "trigger", snapshot.trigger(),
+                "loadedModCount", snapshot.loadedModIds().size()
+        ));
+
+        List<Map<String, Object>> actions = new java.util.ArrayList<>();
+        int priority = 1;
+
+        for (IssueSnapshot issue : snapshot.issues()) {
+            for (var suggestion : issue.suggestions()) {
+                Map<String, Object> action = new LinkedHashMap<>();
+                action.put("id", "action-" + twoDigits(priority));
+                action.put("priority", priority++);
+                action.put("type", actionType(suggestion.safety()));
+                action.put("title", suggestion.title());
+                action.put("issue", Map.of(
+                        "category", issue.category().toString(),
+                        "severity", issue.severity().toString(),
+                        "count", issue.count(),
+                        "signature", issue.signature()
+                ));
+                action.put("likelyMods", issue.likelyModCounts());
+                action.put("confidence", estimateConfidence(issue, suggestion));
+                action.put("riskLevel", safetyToRisk(suggestion.safety()));
+                action.put("description", suggestion.detail());
+                action.put("evidence", issue.evidence());
+                if (!suggestion.url().isBlank()) {
+                    action.put("referenceUrl", suggestion.url());
+                }
+                if (!suggestion.actionBody().isBlank()) {
+                    action.put("actionBody", suggestion.actionBody());
+                    action.put("actionLabel", suggestion.actionLabel().isBlank() ? "Apply" : suggestion.actionLabel());
+                }
+                action.put("successCriteria", successCriteria(issue.category().toString()));
+                actions.add(action);
+            }
+        }
+
+        plan.put("summary", Map.of(
+                "totalIssues", snapshot.issues().size(),
+                "actionableItems", actions.size(),
+                "severityCounts", countBySeverity(snapshot.issues()),
+                "topMod", snapshot.loudestMods().entrySet().stream()
+                        .max((a, b) -> a.getValue().compareTo(b.getValue()))
+                        .map(Map.Entry::getKey)
+                        .orElse("unknown"),
+                "recommendation", generateRecommendation(snapshot)
+        ));
+
+        if (actions.isEmpty()) {
+            plan.put("actions", List.of());
+        } else {
+            plan.put("actions", actions.stream()
+                    .sorted((a, b) -> Integer.compare(
+                            (int) a.get("priority"),
+                            (int) b.get("priority")
+                    ))
+                    .toList());
+        }
+
+        plan.put("environment", Map.of(
+                "minecraftVersion", snapshot.environment().minecraftVersion(),
+                "neoForgeVersion", snapshot.environment().neoForgeVersion(),
+                "javaVersion", snapshot.environment().javaVersion(),
+                "osName", snapshot.environment().osName(),
+                "osVersion", snapshot.environment().osVersion()
+        ));
+
+        if (snapshot.startupTimings() != null && !snapshot.startupTimings().timings().isEmpty()) {
+            plan.put("performanceIssues", snapshot.startupTimings().timings().stream()
+                    .limit(5)
+                    .map(t -> Map.of(
+                            "duration", formatDuration(t.durationMs()),
+                            "category", t.category(),
+                            "label", t.label(),
+                            "detail", t.detail()
+                    ))
+                    .toList());
+        }
+
+        return gson.toJson(plan);
+    }
+
+    private String actionType(String safety) {
+        return switch (safety) {
+            case "version-alignment" -> "update_dependency_version";
+            case "known-issue" -> "wait_for_upstream_fix";
+            case "read-only" -> "documentation_review";
+            default -> safety.contains("draft") ? "apply_patch" : "investigate";
+        };
+    }
+
+    private double estimateConfidence(IssueSnapshot issue, com.sanhiruzu.packlogdoctor.analysis.FixSuggestion suggestion) {
+        if (issue.likelyModCounts().isEmpty()) {
+            return 0.5;
+        }
+        int total = issue.likelyModCounts().values().stream().mapToInt(Integer::intValue).sum();
+        int topMod = issue.likelyModCounts().values().stream().mapToInt(Integer::intValue).max().orElse(0);
+        double modConfidence = (double) topMod / total;
+        double suggestionBonus = suggestion.url().isBlank() ? 0 : 0.1;
+        return Math.min(1.0, modConfidence + suggestionBonus);
+    }
+
+    private String safetyToRisk(String safety) {
+        return switch (safety) {
+            case "read-only" -> "low";
+            case "version-alignment" -> "low";
+            case "known-issue" -> "low";
+            default -> safety.contains("draft") ? "medium" : "unknown";
+        };
+    }
+
+    private String successCriteria(String category) {
+        return switch (category) {
+            case "PERFORMANCE" -> "Reduce log volume or startup time without new errors";
+            case "FEATURE_DEGRADATION" -> "Restore missing functionality or recipe availability";
+            case "COMPATIBILITY" -> "Resolve version conflicts or dependency mismatches";
+            case "MISSING_DATA" -> "Provide missing mod data, assets, or configuration";
+            default -> "Eliminate this category of warning from logs";
+        };
+    }
+
+    private String generateRecommendation(ReportSnapshot snapshot) {
+        int criticalCount = (int) snapshot.issues().stream()
+                .filter(i -> i.severity().toString().equals("ERROR") || i.severity().toString().equals("FATAL"))
+                .count();
+        if (criticalCount > 0) {
+            return "Address " + criticalCount + " critical error(s) immediately before further testing";
+        }
+        if (!snapshot.issues().isEmpty()) {
+            return "Review and apply suggested fixes in priority order; test after each major change";
+        }
+        return "No actionable issues detected";
+    }
+
+    private Map<String, Integer> countBySeverity(List<IssueSnapshot> issues) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (IssueSnapshot issue : issues) {
+            String sev = issue.severity().toString();
+            counts.put(sev, counts.getOrDefault(sev, 0) + 1);
+        }
+        return counts;
     }
 
     private String html(ReportSnapshot snapshot) {
@@ -282,6 +542,11 @@ public final class ReportWriter {
                       <div><h2>Environment</h2><div id="environment"></div></div>
                       <div><h2>Next Actions</h2><div id="nextActions" class="muted"></div></div>
                     </div>
+                    <div class="panel">
+                      <h2>Startup Timings</h2>
+                      <div id="startupTimings" class="muted"></div>
+                    </div>
+                    <div id="uncaughtExceptions"></div>
                     <div id="issues"></div>
                   </section>
                 </main>
@@ -314,6 +579,15 @@ public final class ReportWriter {
                   if (suggestion.safety.includes('draft')) lines.push('Action: draft a datapack/KubeJS patch only after confirming the recipe or tag ID.');
                   if (suggestion.actionBody) lines.push('', suggestion.actionBody);
                   return lines.join('\\n');
+                }
+                function uncaughtText(exception) {
+                  return [
+                    `Thread: ${exception.threadName || 'unknown'}`,
+                    `Time: ${exception.timestamp || 'unknown'}`,
+                    `Message: ${exception.message || ''}`,
+                    '',
+                    exception.stackTrace || ''
+                  ].join('\\n');
                 }
                 function issueReportText(issue) {
                   return [
@@ -403,6 +677,8 @@ public final class ReportWriter {
                   $('changes').innerHTML = (report.environment.modFileChangesSinceLastSuccess || []).slice(0, 12).map(c => `<li><code>${esc(c.fileName)}</code><br><span class="muted">${esc(c.changeType)} - ${esc(c.detail)}</span></li>`).join('') || '<li class="muted">No baseline changes found.</li>';
                   $('recent').innerHTML = (report.environment.modFiles || []).slice(0, 8).map(f => `<li><code>${esc(f.fileName)}</code>${f.enabled ? '' : ' <span class="muted">disabled</span>'}</li>`).join('');
                   $('provenance').innerHTML = (report.environment.modProvenance || []).slice(0, 10).map(p => `<li><code>${esc(p.fileName)}</code><br><span class="muted">${esc(p.confidence)}${p.modrinthHash ? ' | Modrinth hash' : ''}${p.curseForgeFingerprint ? ' | CurseForge fingerprint' : ''}</span></li>`).join('') || '<li class="muted">No provenance hints found.</li>';
+                  $('startupTimings').innerHTML = startupTimingHtml();
+                  $('uncaughtExceptions').innerHTML = uncaughtExceptionHtml();
                   optionize('severity', new Set(report.issues.map(i => i.severity)));
                   optionize('category', new Set(report.issues.map(i => i.category)));
                   optionize('mod', new Set(report.issues.flatMap(i => Object.keys(i.likelyModCounts || {}))));
@@ -412,6 +688,35 @@ public final class ReportWriter {
                 function nextActions() {
                   const first = report.issues.slice(0, 5).map(i => `<li><strong>${esc(i.category)}</strong>: ${esc(topMod(i))} (${esc(i.severity)} x${i.count})</li>`).join('');
                   return `<ul>${first}</ul><p>Generated fix drafts are written to <code>pack-log-doctor/drafts/</code> when available.</p><button id="showActions">Show action notes</button><div id="actionNotes" style="display:none;margin-top:10px"><textarea readonly></textarea><div class="actions"><button id="copyActions">Copy all action notes</button></div></div>`;
+                }
+                function startupTimingHtml() {
+                  const data = report.startupTimings || {};
+                  const timings = (data.timings || []).slice(0, 10);
+                  const gaps = (data.gaps || []).slice(0, 6);
+                  if (!timings.length && !gaps.length) return 'No startup timing events captured yet.';
+                  const timingItems = timings.map(t => `<li><strong>${esc(formatMs(t.durationMs))}</strong> <code>${esc(t.category)}</code> ${esc(t.label)}<br><span class="muted">${esc(t.detail)}</span></li>`).join('');
+                  const gapItems = gaps.map(g => `<li><strong>${esc(formatMs(g.durationMs))}</strong><br><span class="muted">Before: ${esc(g.before)}</span><br><span class="muted">After: ${esc(g.after)}</span></li>`).join('');
+                  return `${timingItems ? `<h2>Explicit durations</h2><ul>${timingItems}</ul>` : ''}${gapItems ? `<h2>Largest log gaps</h2><ul>${gapItems}</ul>` : ''}`;
+                }
+                function uncaughtExceptionHtml() {
+                  const exceptions = report.uncaughtExceptions || [];
+                  if (!exceptions.length) return '';
+                  return `<section class="panel"><h2>Uncaught Exceptions</h2><p class="muted">These crash-triggering exceptions are shown outside grouped log filtering.</p>${exceptions.map((exception, index) => `
+                    <article class="issue open">
+                      <div class="issue-head">
+                        <span class="badge FATAL">FATAL</span>
+                        <div><div><span class="cat">Uncaught</span> ${esc(exception.threadName || 'unknown thread')}</div><div class="muted">${esc(exception.message || '')}</div></div>
+                        <span class="muted">#${index + 1}</span>
+                      </div>
+                      <div class="issue-body">
+                        <pre><code>${esc(exception.stackTrace || exception.message || '')}</code></pre>
+                        <div class="actions"><button data-copy="${esc(uncaughtText(exception))}">Copy exception</button></div>
+                      </div>
+                    </article>`).join('')}</section>`;
+                }
+                function formatMs(ms) {
+                  const value = Number(ms || 0);
+                  return value >= 1000 ? `${(value / 1000).toFixed(2)}s` : `${value}ms`;
                 }
                 function renderIssues() {
                   const q = $('search').value.toLowerCase();
@@ -485,11 +790,13 @@ public final class ReportWriter {
         builder.append("- Loaded mods known to analyzer: ").append(snapshot.loadedModIds().size()).append("\n\n");
 
         appendEnvironment(builder, snapshot.environment());
+        appendStartupTimings(builder, snapshot.startupTimings());
         appendModFileChanges(builder, snapshot.environment());
         appendRecentModFiles(builder, snapshot.environment());
         appendProvenance(builder, snapshot.environment());
         appendChangeSuspects(builder, snapshot.environment());
         appendDependencyContext(builder, snapshot);
+        appendUncaughtExceptions(builder, snapshot.uncaughtExceptions());
 
         builder.append("## Loudest likely mods\n\n");
         if (snapshot.loudestMods().isEmpty()) {
@@ -554,6 +861,26 @@ public final class ReportWriter {
         return builder.toString();
     }
 
+    private void appendUncaughtExceptions(StringBuilder builder, List<UncaughtExceptionSnapshot> uncaughtExceptions) {
+        if (uncaughtExceptions == null || uncaughtExceptions.isEmpty()) {
+            return;
+        }
+
+        builder.append("## Uncaught exceptions\n\n");
+        builder.append("These are the exception(s) that triggered terminal report writing. ")
+                .append("They are shown separately from grouped log noise so crash stacks are not hidden by baseline filtering.\n\n");
+        int index = 1;
+        for (UncaughtExceptionSnapshot exception : uncaughtExceptions) {
+            builder.append("### Exception ").append(index++).append("\n\n");
+            builder.append("- Time: ").append(DateTimeFormatter.ISO_INSTANT.format(exception.timestamp())).append('\n');
+            builder.append("- Thread: `").append(exception.threadName()).append("`\n");
+            builder.append("- Message: `").append(exception.message()).append("`\n\n");
+            if (!exception.stackTrace().isBlank()) {
+                builder.append("```text\n").append(exception.stackTrace()).append("\n```\n\n");
+            }
+        }
+    }
+
     private void appendEnvironment(StringBuilder builder, ReportEnvironment environment) {
         builder.append("## Environment\n\n");
         appendOptional(builder, "Modpack", environment.modpackName());
@@ -574,6 +901,45 @@ public final class ReportWriter {
         if (value != null && !value.isBlank()) {
             builder.append("- ").append(label).append(": ").append(value).append('\n');
         }
+    }
+
+    private void appendStartupTimings(StringBuilder builder, StartupTimingReport timings) {
+        if (timings == null || (timings.timings().isEmpty() && timings.gaps().isEmpty())) {
+            return;
+        }
+
+        builder.append("## Startup timings\n\n");
+        if (timings.observedDurationMs() > 0L) {
+            builder.append("- Observed log window: ").append(formatDuration(timings.observedDurationMs())).append('\n');
+        }
+        if (!timings.timings().isEmpty()) {
+            builder.append("- Slow explicit timings:\n");
+            timings.timings().stream()
+                    .limit(12)
+                    .forEach(timing -> builder.append("  - ")
+                            .append(formatDuration(timing.durationMs()))
+                            .append(" `").append(timing.category()).append("` ")
+                            .append(timing.label())
+                            .append(" - ").append(timing.detail())
+                            .append('\n'));
+        }
+        if (!timings.gaps().isEmpty()) {
+            builder.append("- Largest quiet gaps between log events:\n");
+            timings.gaps().stream()
+                    .limit(8)
+                    .forEach(gap -> builder.append("  - ")
+                            .append(formatDuration(gap.durationMs()))
+                            .append(" after `").append(gap.before()).append("`; next `")
+                            .append(gap.after()).append("`\n"));
+        }
+        builder.append('\n');
+    }
+
+    private String formatDuration(long durationMs) {
+        if (durationMs >= 1000L) {
+            return String.format(java.util.Locale.ROOT, "%.2fs", durationMs / 1000.0);
+        }
+        return durationMs + "ms";
     }
 
     private void appendModFileChanges(StringBuilder builder, ReportEnvironment environment) {
@@ -742,5 +1108,51 @@ public final class ReportWriter {
             builder.append('`').append(entry.getKey()).append("`=").append(entry.getValue());
         }
         return builder.toString();
+    }
+
+    private void writeSuggestedSuppressions(ReportSnapshot snapshot) {
+        try {
+            List<com.sanhiruzu.packlogdoctor.runtime.SuppressionConfig.SuppressionRule> suggested = new java.util.ArrayList<>();
+            Map<String, Integer> loggerCounts = new LinkedHashMap<>();
+
+            for (IssueSnapshot issue : snapshot.issues()) {
+                if (issue.severity() != Severity.WARN) {
+                    continue;
+                }
+                for (String logger : issue.loggerCounts().keySet()) {
+                    loggerCounts.put(logger, loggerCounts.getOrDefault(logger, 0) + issue.loggerCounts().get(logger));
+                }
+            }
+
+            for (Map.Entry<String, Integer> entry : loggerCounts.entrySet()) {
+                if (entry.getValue() >= 3) {
+                    suggested.add(new com.sanhiruzu.packlogdoctor.runtime.SuppressionConfig.SuppressionRule(
+                            entry.getKey(),
+                            null,
+                            null
+                    ));
+                }
+            }
+
+            if (!suggested.isEmpty()) {
+                com.sanhiruzu.packlogdoctor.runtime.SuppressionConfig.writeSuggested(
+                        outputDir.resolve("suppression-config.json"),
+                        suggested
+                );
+            }
+        } catch (Exception e) {
+        }
+    }
+
+    private void writeLog4j2Config() {
+        try {
+            com.sanhiruzu.packlogdoctor.runtime.SuppressionConfig config =
+                    com.sanhiruzu.packlogdoctor.runtime.SuppressionConfig.load(outputDir.resolve("suppression-config.json"));
+            com.sanhiruzu.packlogdoctor.runtime.Log4j2ConfigGenerator.generate(
+                    outputDir.resolve("log4j2-filter.xml"),
+                    config
+            );
+        } catch (Exception e) {
+        }
     }
 }
