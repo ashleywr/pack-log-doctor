@@ -111,4 +111,7 @@ sourceSets.main.resources.srcDir generateModMetadata
 neoForge.ideSyncTask generateModMetadata
 
 ext.synesthesiaLocalModKey = 'packlogdoctor'
-apply from: 'C:/WorkDir/synesthesia/tools/synesthesia-sync.gradle'
+def synesthesiaSyncScript = file('C:/WorkDir/synesthesia/tools/synesthesia-sync.gradle')
+if (synesthesiaSyncScript.exists()) {
+    apply from: synesthesiaSyncScript
+}
